@@ -1,11 +1,9 @@
 
+
 name: Pump Early Detector
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
 
 jobs:
   run-bot:
@@ -13,20 +11,21 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Checkout repository
+      - name: Repository dosyalarını indir
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Python kur
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Gereksinimleri yükle
         run: pip install -r requirements.txt
 
-      - name: Start Telegram bot
+      - name: Botu başlat
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           HELIUS_RPC: ${{ secrets.HELIUS_RPC }}
+          FOMO_API_KEY: ${{ secrets.FOMO_API_KEY }}
         run: python -u main.py
