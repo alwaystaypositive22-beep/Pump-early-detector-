@@ -2,6 +2,7 @@
 
 
 
+
 import asyncio
 import aiohttp
 import websockets
@@ -11,40 +12,33 @@ import time
 import csv
 import html
 
-# --------------------------------------------------
-# AYARLAR
-# --------------------------------------------------
-
+# GITHUB SECRETS
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 HELIUS_RPC = os.environ["HELIUS_RPC"]
 
+# SETTINGS
 PUMPPORTAL_WS = "wss://pumpportal.fun/api/data"
 
-CHECK_DELAY_SEC = 25
-MAX_DEV_BUY_PCT = 10.0
-MAX_TOP10_ACCOUNTS_PCT = 35.0
-MIN_DEV_WALLET_TX = 5
+CHECK_DELAY_SEC = 20
+MAX_CONCURRENT_CHECKS = 3
+MAX_ACTIVE_TASKS = 60
 
-REQUIRE_SOCIALS = False
-SEND_SUSPICIOUS = False
+# Minimum değerlendirme puanı
+MIN_SCORE = 2
 
-MAX_CONCURRENT_CHECKS = 5
-MAX_ACTIVE_TASKS = 100
+# Her yeni token için bildirim gönderilmez.
+# Yalnızca yeterli kontrol sinyali alanlar gönderilir.
 LOG_FILE = "token_log.csv"
-
-# --------------------------------------------------
-# DURUM
-# --------------------------------------------------
 
 seen_tokens = set()
 active_tasks = set()
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
 
 
-# --------------------------------------------------
-# HELIUS RPC
-# --------------------------------------------------
+# -------------------------
+# HELIUS RPC WITH RETRIES
+# -------------------------
 
 async def rpc(session, method, params):
     payload = {
@@ -54,22 +48,83 @@ async def rpc(session, method, params):
         "params": params
     }
 
-    async with session.post(
-        HELIUS_RPC,
-        json=payload,
-        timeout=aiohttp.ClientTimeout(total=15)
-    ) as response:
+    for attempt in range(5):
+        try:
+            async with session.post(
+                HELIUS_RPC,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=20)
+            ) as response:
 
-        response.raise_for_status()
-        data = await response.json()
+                if response.status in (429, 500, 502, 503, 504):
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
 
-        if "error" in data:
-            raise RuntimeError(str(data["error"]))
+                response.raise_for_status()
+                data = await response.json()
 
-        return data.get("result")
+                if "error" in data:
+                    error = data["error"]
+                    message = str(error.get("message", error))
+
+                    temporary_errors = (
+                        "overloaded",
+                        "could not find account",
+                        "not found",
+                        "rate limit"
+                    )
+
+                    if any(x in message.lower() for x in temporary_errors):
+                        await asyncio.sleep(2 * (attempt + 1))
+                        continue
+
+                    raise RuntimeError(message)
+
+                return data.get("result")
+
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            if attempt == 4:
+                raise
+
+            await asyncio.sleep(2 * (attempt + 1))
+
+    return None
 
 
-async def dev_wallet_tx_count(session, dev):
+# -------------------------
+# TOKEN SUPPLY
+# -------------------------
+
+async def get_supply(session, mint):
+    for attempt in range(4):
+        try:
+            result = await rpc(
+                session,
+                "getTokenSupply",
+                [mint]
+            )
+
+            if result and result.get("value"):
+                value = result["value"]
+                amount = value.get("amount")
+                decimals = int(value.get("decimals", 0))
+
+                if amount is not None:
+                    return int(amount) / (10 ** decimals)
+
+        except Exception as error:
+            print("Arz kontrolü:", error)
+
+        await asyncio.sleep(3 * (attempt + 1))
+
+    return None
+
+
+# -------------------------
+# DEV WALLET HISTORY
+# -------------------------
+
+async def get_dev_history(session, dev):
     result = await rpc(
         session,
         "getSignaturesForAddress",
@@ -79,19 +134,36 @@ async def dev_wallet_tx_count(session, dev):
     if result is None:
         return None
 
-    # Bu sayı toplam geçmiş değil,
-    # son 50 imza içindeki işlem sayısıdır.
     return len(result)
 
 
-async def fetch_metadata(session, uri):
+# -------------------------
+# METADATA
+# -------------------------
+
+def normalize_metadata_url(uri):
     if not uri:
+        return None
+
+    if uri.startswith("ipfs://"):
+        return "https://ipfs.io/ipfs/" + uri[7:]
+
+    if uri.startswith("ar://"):
+        return "https://arweave.net/" + uri[5:]
+
+    return uri
+
+
+async def fetch_metadata(session, uri):
+    url = normalize_metadata_url(uri)
+
+    if not url:
         return {}
 
     try:
         async with session.get(
-            uri,
-            timeout=aiohttp.ClientTimeout(total=8)
+            url,
+            timeout=aiohttp.ClientTimeout(total=12)
         ) as response:
 
             if response.status != 200:
@@ -104,212 +176,94 @@ async def fetch_metadata(session, uri):
         return {}
 
 
-async def get_supply(session, mint):
-    result = await rpc(
-        session,
-        "getTokenSupply",
-        [mint]
-    )
-
-    if not result or not result.get("value"):
-        return None
-
-    value = result["value"]
-
-    ui_amount = value.get("uiAmount")
-
-    if ui_amount is not None:
-        return float(ui_amount)
-
-    amount = value.get("amount")
-    decimals = int(value.get("decimals", 0))
-
-    if amount is None:
-        return None
-
-    return int(amount) / (10 ** decimals)
-
-
-async def top10_account_percent(
-    session,
-    mint,
-    bonding_curve
-):
-    largest, curve_accounts, supply = await asyncio.gather(
-        rpc(
-            session,
-            "getTokenLargestAccounts",
-            [mint]
-        ),
-        rpc(
-            session,
-            "getTokenAccountsByOwner",
-            [
-                bonding_curve,
-                {"mint": mint},
-                {"encoding": "jsonParsed"}
-            ]
-        ),
-        get_supply(session, mint)
-    )
-
-    if not largest or not curve_accounts or not supply:
-        return None
-
-    curve_addresses = {
-        account["pubkey"]
-        for account in curve_accounts.get("value", [])
-    }
-
-    accounts = largest.get("value", [])
-
-    # Bonding curve hesaplarını hariç tut.
-    holders = [
-        account
-        for account in accounts
-        if account["address"] not in curve_addresses
-    ]
-
-    top10_amount = sum(
-        float(account.get("uiAmount") or 0)
-        for account in holders[:10]
-    )
-
-    return (top10_amount / supply) * 100
-
-
-# --------------------------------------------------
-# TOKEN ANALİZİ
-# --------------------------------------------------
+# -------------------------
+# TOKEN ANALYSIS
+# -------------------------
 
 async def evaluate(session, token):
-    flags = []
-    warnings = []
-    data_missing = []
-
     mint = token.get("mint")
     dev = token.get("traderPublicKey")
-    bonding_curve = token.get("bondingCurveKey")
 
     if not mint or not dev:
-        return "VERİ EKSİK", ["Token veya dev adresi yok"], {}
+        return None
 
-    # 1. Dev ilk alım oranı
-    initial_buy = token.get("initialBuy")
+    warnings = []
+    missing = []
+    score = 0
 
-    dev_pct = None
+    # 1. TOKEN SUPPLY
+    supply = await get_supply(session, mint)
 
+    if supply is None:
+        missing.append("Token arzı henüz alınamadı")
+    else:
+        score += 1
+
+    # 2. DEV WALLET
     try:
-        if initial_buy is not None:
-            supply = await get_supply(session, mint)
+        dev_history = await get_dev_history(session, dev)
 
-            if supply and supply > 0:
-                dev_pct = (
-                    float(initial_buy) / supply
-                ) * 100
+        if dev_history is None:
+            missing.append("Dev geçmişi alınamadı")
 
-                if dev_pct > MAX_DEV_BUY_PCT:
-                    flags.append(
-                        f"Dev ilk alımı yüksek: %{dev_pct:.2f}"
-                    )
-            else:
-                data_missing.append("Token arzı alınamadı")
-        else:
-            data_missing.append("Dev ilk alım verisi yok")
-
-    except Exception as error:
-        print("İlk alım kontrolü:", error)
-        data_missing.append("İlk alım kontrolü başarısız")
-
-    # 2. Dev cüzdan geçmişi
-    try:
-        tx_count = await dev_wallet_tx_count(
-            session,
-            dev
-        )
-
-        if tx_count is None:
-            data_missing.append("Dev işlem geçmişi alınamadı")
-        elif tx_count < MIN_DEV_WALLET_TX:
-            flags.append(
-                f"Dev cüzdanı çok yeni: {tx_count} işlem"
+        elif dev_history < 5:
+            warnings.append(
+                f"Dev cüzdanında son 50 imza içinde yalnızca {dev_history} kayıt var"
             )
 
-    except Exception as error:
-        print("Dev geçmişi hatası:", error)
-        tx_count = None
-        data_missing.append("Dev geçmişi kontrol edilemedi")
+        else:
+            score += 1
 
-    # 3. Sosyal bağlantılar
+    except Exception as error:
+        print("Dev kontrolü:", error)
+        dev_history = None
+        missing.append("Dev geçmişi kontrol edilemedi")
+
+    # 3. METADATA AND SOCIALS
     metadata = await fetch_metadata(
         session,
         token.get("uri", "")
     )
 
-    socials = {
-        key: metadata.get(key)
-        for key in ("twitter", "telegram", "website")
-        if metadata.get(key)
-    }
+    socials = {}
 
-    if not socials:
+    for key in ("twitter", "telegram", "website"):
+        value = metadata.get(key)
+
+        if value:
+            socials[key] = value
+
+    if socials:
+        score += 1
+    else:
         warnings.append("Sosyal bağlantı bulunamadı")
 
-        if REQUIRE_SOCIALS:
-            flags.append("Sosyal bağlantı zorunlu")
+    # 4. WAIT FOR EARLY TOKEN DATA
+    await asyncio.sleep(CHECK_DELAY_SEC)
 
-    # 4. Holder yoğunluğu
-    top10 = None
-
-    if bonding_curve:
-        try:
-            await asyncio.sleep(CHECK_DELAY_SEC)
-
-            top10 = await top10_account_percent(
-                session,
-                mint,
-                bonding_curve
-            )
-
-            if top10 is None:
-                data_missing.append(
-                    "Holder hesapları alınamadı"
-                )
-
-            elif top10 > MAX_TOP10_ACCOUNTS_PCT:
-                flags.append(
-                    f"İlk 10 hesap yoğunluğu yüksek: %{top10:.2f}"
-                )
-
-        except Exception as error:
-            print("Holder kontrolü:", error)
-            data_missing.append("Holder kontrolü başarısız")
-
+    # Missing data is not automatically a scam signal.
+    if missing:
+        verdict = "VERİ EKSİK"
+    elif score >= MIN_SCORE:
+        verdict = "İNCELEMEYE DEĞER"
     else:
-        data_missing.append("Bonding curve adresi yok")
+        verdict = "DÜŞÜK SİNYAL"
 
     info = {
-        "dev_pct": dev_pct,
-        "tx_count": tx_count,
-        "top10": top10,
+        "supply": supply,
+        "dev_history": dev_history,
         "socials": socials,
         "warnings": warnings,
-        "data_missing": data_missing
+        "missing": missing,
+        "score": score
     }
 
-    # Eksik veri varsa GEÇTİ demiyoruz.
-    if data_missing:
-        return "VERİ EKSİK", flags + data_missing, info
-
-    if flags:
-        return "ŞÜPHELİ", flags, info
-
-    return "GEÇTİ", warnings, info
+    return verdict, info
 
 
-# --------------------------------------------------
+# -------------------------
 # TELEGRAM
-# --------------------------------------------------
+# -------------------------
 
 async def send_telegram(session, message):
     url = (
@@ -327,58 +281,70 @@ async def send_telegram(session, message):
     async with session.post(
         url,
         json=payload,
-        timeout=aiohttp.ClientTimeout(total=15)
+        timeout=aiohttp.ClientTimeout(total=20)
     ) as response:
 
         if response.status != 200:
-            error_text = await response.text()
-            raise RuntimeError(
-                f"Telegram hatası: {error_text}"
-            )
+            error = await response.text()
+            raise RuntimeError(error)
 
 
-def format_message(token, verdict, flags, info):
+def format_message(token, verdict, info):
     mint = token["mint"]
 
-    name = html.escape(str(token.get("name") or "Bilinmiyor"))
-    symbol = html.escape(str(token.get("symbol") or "?"))
-
-    dev_pct = (
-        f"%{info['dev_pct']:.2f}"
-        if info["dev_pct"] is not None
-        else "Bilinmiyor"
+    name = html.escape(
+        str(token.get("name") or "Bilinmiyor")
     )
 
-    tx_count = (
-        str(info["tx_count"])
-        if info["tx_count"] is not None
-        else "Bilinmiyor"
+    symbol = html.escape(
+        str(token.get("symbol") or "?")
     )
 
-    top10 = (
-        f"%{info['top10']:.2f}"
-        if info["top10"] is not None
-        else "Bilinmiyor"
-    )
+    dev_history = info["dev_history"]
 
-    emoji = "✅" if verdict == "GEÇTİ" else "⚠️"
+    if dev_history is None:
+        dev_text = "Alınamadı"
+    else:
+        dev_text = str(dev_history)
+
+    supply = info["supply"]
+
+    if supply is None:
+        supply_text = "Henüz alınamadı"
+    else:
+        supply_text = f"{supply:,.0f}"
 
     lines = [
-        f"{emoji} <b>{verdict}</b>",
+        "🔎 <b>YENİ PUMP.FUN TOKEN</b>",
+        "",
         f"<b>{name} (${symbol})</b>",
         "",
-        f"Dev ilk alım: {dev_pct}",
-        f"Dev son 50 imza sayısı: {tx_count}",
-        f"İlk 10 token hesabı yoğunluğu: {top10}",
+        f"Değerlendirme: {verdict}",
+        f"Sinyal puanı: {info['score']}/3",
+        f"Token arzı: {supply_text}",
+        f"Dev son 50 imza sayısı: {dev_text}",
         f"Market cap: {token.get('marketCapSol', '?')} SOL",
+        "",
+        "⚠️ Bu sonuç güvenlik garantisi değildir."
     ]
 
-    if flags:
+    if info["warnings"]:
         lines += [
             "",
-            "<b>Risk / veri uyarıları:</b>",
-            html.escape("; ".join(flags))
+            "<b>Uyarılar:</b>"
         ]
+
+        for warning in info["warnings"]:
+            lines.append(html.escape(warning))
+
+    if info["missing"]:
+        lines += [
+            "",
+            "<b>Eksik veriler:</b>"
+        ]
+
+        for item in info["missing"]:
+            lines.append(html.escape(item))
 
     if info["socials"]:
         lines += [
@@ -394,6 +360,7 @@ def format_message(token, verdict, flags, info):
     lines += [
         "",
         f"<code>{html.escape(mint)}</code>",
+        "",
         f"https://pump.fun/coin/{mint}",
         f"https://dexscreener.com/solana/{mint}",
         f"https://rugcheck.xyz/tokens/{mint}"
@@ -402,11 +369,11 @@ def format_message(token, verdict, flags, info):
     return "\n".join(lines)
 
 
-# --------------------------------------------------
-# CSV KAYDI
-# --------------------------------------------------
+# -------------------------
+# CSV LOGGING
+# -------------------------
 
-def log_token(token, verdict, flags, info):
+def log_token(token, verdict, info):
     new_file = not os.path.exists(LOG_FILE)
 
     try:
@@ -425,11 +392,10 @@ def log_token(token, verdict, flags, info):
                     "mint",
                     "symbol",
                     "market_cap_sol",
-                    "dev_pct",
-                    "dev_tx_count",
-                    "top10_account_pct",
-                    "verdict",
-                    "flags"
+                    "supply",
+                    "dev_history",
+                    "score",
+                    "verdict"
                 ])
 
             writer.writerow([
@@ -437,20 +403,19 @@ def log_token(token, verdict, flags, info):
                 token.get("mint"),
                 token.get("symbol"),
                 token.get("marketCapSol"),
-                info.get("dev_pct"),
-                info.get("tx_count"),
-                info.get("top10"),
-                verdict,
-                "; ".join(flags)
+                info.get("supply"),
+                info.get("dev_history"),
+                info.get("score"),
+                verdict
             ])
 
     except Exception as error:
-        print("CSV kayıt hatası:", error)
+        print("CSV hatası:", error)
 
 
-# --------------------------------------------------
-# TOKEN İŞLEME
-# --------------------------------------------------
+# -------------------------
+# PROCESS TOKEN
+# -------------------------
 
 async def handle_token(session, token):
     mint = token.get("mint")
@@ -460,35 +425,29 @@ async def handle_token(session, token):
 
     async with semaphore:
         try:
-            verdict, flags, info = await evaluate(
-                session,
-                token
-            )
+            result = await evaluate(session, token)
 
-            log_token(
-                token,
-                verdict,
-                flags,
-                info
-            )
+            if result is None:
+                return
+
+            verdict, info = result
+
+            log_token(token, verdict, info)
 
             print(
-                f"{token.get('symbol', '?')}: {verdict} "
-                f"| Uyarı: {len(flags)}"
+                f"{token.get('symbol', '?')}: "
+                f"{verdict} | Puan: {info['score']}/3"
             )
 
-            if verdict == "GEÇTİ" or SEND_SUSPICIOUS:
+            # Notify only when enough signals exist.
+            if verdict == "İNCELEMEYE DEĞER":
                 message = format_message(
                     token,
                     verdict,
-                    flags,
                     info
                 )
 
-                await send_telegram(
-                    session,
-                    message
-                )
+                await send_telegram(session, message)
 
                 print(
                     f"{token.get('symbol', '?')}: "
@@ -501,16 +460,16 @@ async def handle_token(session, token):
             )
 
 
-# --------------------------------------------------
-# PUMP.FUN DİNLEME
-# --------------------------------------------------
+# -------------------------
+# MAIN WEBSOCKET LOOP
+# -------------------------
 
 async def main():
-    timeout = aiohttp.ClientTimeout(total=20)
+    timeout = aiohttp.ClientTimeout(total=25)
 
     connector = aiohttp.TCPConnector(
-        limit=20,
-        limit_per_host=10
+        limit=15,
+        limit_per_host=5
     )
 
     async with aiohttp.ClientSession(
@@ -527,9 +486,11 @@ async def main():
                     close_timeout=10
                 ) as ws:
 
-                    await ws.send(json.dumps({
-                        "method": "subscribeNewToken"
-                    }))
+                    await ws.send(
+                        json.dumps({
+                            "method": "subscribeNewToken"
+                        })
+                    )
 
                     print(
                         "Pump.fun yeni token takibi aktif."
@@ -550,7 +511,7 @@ async def main():
                             if len(active_tasks) >= MAX_ACTIVE_TASKS:
                                 print(
                                     "Analiz kuyruğu dolu, "
-                                    "yeni token atlandı."
+                                    "token atlandı."
                                 )
                                 continue
 
