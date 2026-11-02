@@ -1,0 +1,26 @@
+
+name: FOMO API Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-fomo:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Repository dosyalarını indir
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Gereksinimleri yükle
+        run: pip install -r requirements.txt
+
+      - name: FOMO API bağlantısını test et
+        env:
+          FOMO_API_KEY: ${{ secrets.FOMO_API_KEY }}
+        run: python -u fomo_test.py
